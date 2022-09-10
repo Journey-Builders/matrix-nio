@@ -1189,7 +1189,7 @@ class RoomMessagesResponse(Response):
 
     chunk: List[Union[Event, BadEventType]] = field()
     start: str = field()
-    end: str = field()
+    end: str = field(default=None)
 
     @classmethod
     @verify(Schemas.room_messages, RoomMessagesError)
@@ -1201,7 +1201,7 @@ class RoomMessagesResponse(Response):
         # type: (...) -> Union[RoomMessagesResponse, ErrorResponse]
         chunk: List[Union[Event, BadEventType]] = []
         chunk = SyncResponse._get_room_events(parsed_dict["chunk"])
-        return cls(room_id, chunk, parsed_dict["start"], parsed_dict["end"])
+        return cls(room_id, chunk, parsed_dict["start"], parsed_dict.get("end"))
 
 
 @dataclass

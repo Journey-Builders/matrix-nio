@@ -1131,7 +1131,7 @@ class Schemas:
             "start": {"type": "string"},
             "end": {"type": "string"},
         },
-        "required": ["chunk", "start", "end"],
+        "required": ["chunk", "start"],
     }
 
     room_context = {
