@@ -4229,3 +4229,9 @@ class TestClass:
         assert not asyncio.iscoroutinefunction(
             mock.restore_login
         ), "not logged_in method should not be awaitable"
+
+        assert (
+            mock.access_token
+        ), "client attribute is `access_token` accessible in mock"
+        with pytest.raises(AttributeError):
+            mock.random_nonexistent_attribute
