@@ -198,6 +198,12 @@ class Client:
 
     """
 
+    access_token: str = ""
+    user_id: str = ""
+    next_batch: str = ""
+    rooms: Dict[str, MatrixRoom] = {}
+    invited_rooms: Dict[str, MatrixInvitedRoom] = {}
+
     def __init__(
         self,
         user: str,
