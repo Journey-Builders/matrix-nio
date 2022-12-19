@@ -3,7 +3,6 @@ import inspect
 import json
 import math
 import re
-import sys
 import time
 from datetime import datetime, timedelta
 from os import path
@@ -125,7 +124,7 @@ from nio import (
 )
 from nio.api import EventFormat, ResizingMethod, RoomPreset, RoomVisibility
 from nio.client.async_client import connect_wrapper, on_request_chunk_sent
-from nio.crypto import OlmDevice, Session, TrustState, decrypt_attachment
+from nio.crypto import OlmDevice, Session, decrypt_attachment
 
 TEST_ROOM_ID = "!testroom:example.org"
 
@@ -2879,8 +2878,8 @@ class TestClass:
         assert new_session != wedged_session
         assert new_session.use_time > wedged_session.use_time
 
-    async def test_key_sharing(self, async_client_pair_same_user, aioresponse):
-        alice, bob = async_client_pair_same_user
+    async def test_key_sharing(self, async_client_pair, aioresponse):
+        alice, bob = async_client_pair
 
         assert alice.logged_in
         assert bob.logged_in
@@ -2889,6 +2888,16 @@ class TestClass:
             self.synce_response_for(alice.user_id, bob.user_id)
         )
         await bob.receive_response(self.synce_response_for(bob.user_id, alice.user_id))
+
+        alice_device = OlmDevice(
+            alice.user_id, alice.device_id, alice.olm.account.identity_keys
+        )
+        bob_device = OlmDevice(
+            bob.user_id, bob.device_id, bob.olm.account.identity_keys
+        )
+
+        alice.olm.device_store.add(bob_device)
+        bob.olm.device_store.add(alice_device)
 
         alice_to_share = alice.olm.share_keys()
         alice_one_time = list(alice_to_share["one_time_keys"].items())[0]
@@ -2935,8 +2944,6 @@ class TestClass:
 
         aioresponse.put(bob_to_device_url, callback=alice_to_device_cb, repeat=True)
         aioresponse.put(alice_to_device_url, callback=bob_to_device_cb, repeat=True)
-
-        bob_device = alice.device_store[bob.user_id][bob.device_id]
 
         session = alice.olm.session_store.get(bob_device.curve25519)
         assert not session
@@ -2995,8 +3002,10 @@ class TestClass:
         # modify the message here.
         to_device_for_bob = {
             "messages": {
-                bob.user_id: {
-                    bob.device_id: to_device_for_bob["messages"][alice.user_id]["*"]
+                bob_device.user_id: {
+                    bob_device.device_id: to_device_for_bob["messages"][
+                        alice_device.user_id
+                    ]["*"]
                 }
             }
         }
@@ -3235,10 +3244,104 @@ class TestClass:
 
         await bob.share_group_session(TEST_ROOM_ID)
 
-    async def test_key_sharing_callbacks(
-        self, async_client_pair_same_user, aioresponse
-    ):
-        alice, bob = async_client_pair_same_user
+        # Check that the group session is indeed marked as shared.
+        group_session = bob.olm.outbound_group_sessions[TEST_ROOM_ID]
+        assert group_session.shared
+        assert to_device_for_alice
+        to_device_for_alice = None
+        to_device_for_bob = None
+
+        # We deliberately don't share the message with alice
+        message = {
+            "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "It's a secret to everybody."},
+        }
+        encrypted_content = bob.olm.group_encrypt(TEST_ROOM_ID, message)
+
+        encrypted_message = {
+            "event_id": "!event_id",
+            "type": "m.room.encrypted",
+            "sender": bob.user_id,
+            "origin_server_ts": int(time.time()),
+            "content": encrypted_content,
+            "room_id": TEST_ROOM_ID,
+        }
+
+        aioresponse.get(
+            sync_url,
+            status=200,
+            payload=self.sync_with_room_event(encrypted_message, "3"),
+        )
+
+        response = await alice.sync()
+
+        assert isinstance(response, SyncResponse)
+
+        # Alice received the event but wasn't able to decrypt it.
+        event = response.rooms.join[TEST_ROOM_ID].timeline.events[0]
+        assert isinstance(event, MegolmEvent)
+        assert not to_device_for_bob
+
+        # Let us request the key from bob again.
+        await alice.request_room_key(event)
+
+        # Check that bob will receive a message.
+        assert to_device_for_bob
+
+        # The client doesn't for now know how to re-request keys from bob, so
+        # modify the message here.
+        to_device_for_bob = {
+            "messages": {
+                bob_device.user_id: {
+                    bob_device.device_id: to_device_for_bob["messages"][
+                        alice_device.user_id
+                    ]["*"]
+                }
+            }
+        }
+
+        aioresponse.get(
+            sync_url,
+            status=200,
+            payload=self.sync_with_to_device_events(
+                self.olm_message_to_event(
+                    to_device_for_bob, bob, alice, "m.room_key_request"
+                ),
+                "4",
+            ),
+        )
+
+        assert not bob.outgoing_to_device_messages
+
+        # Bob syncs and receives a message.
+        await bob.sync()
+
+        # The key is now queued up for alice.
+        assert bob.outgoing_to_device_messages
+
+        assert not to_device_for_alice
+        # Let's send out that message.
+        await bob.send_to_device_messages()
+        assert to_device_for_alice
+
+        aioresponse.get(
+            sync_url,
+            status=200,
+            payload=self.sync_with_to_device_events(
+                self.olm_message_to_event(to_device_for_alice, alice, bob), "5"
+            ),
+        )
+
+        # Alice syncs and receives the forwarded key.
+        await alice.sync()
+
+        # Alice tries to decrypt the previous event again.
+        decrypted_event = alice.decrypt_event(event)
+        assert isinstance(decrypted_event, RoomMessageText)
+        assert decrypted_event.body == "It's a secret to everybody."
+
+    async def test_key_sharing_callbacks(self, async_client_pair, aioresponse):
+        alice, bob = async_client_pair
 
         assert alice.logged_in
         assert bob.logged_in
@@ -3259,9 +3362,6 @@ class TestClass:
         bob_device = OlmDevice(
             bob.user_id, bob.device_id, bob.olm.account.identity_keys
         )
-
-        bob.olm.verify_device(alice_device)
-        alice.olm.verify_device(bob_device)
 
         def key_request_cb(event):
             print(event)
@@ -4002,9 +4102,6 @@ class TestClass:
         assert event.body == "It's a secret to everybody."
         assert cb_ran
 
-    @pytest.mark.skipif(
-        sys.version_info[0:2] == (3, 11), reason="fails due to cpython bug #99277"
-    )
     async def test_connect_wrapper(self, async_client, aioresponse):
         domain = "https://example.org"
 
@@ -4022,14 +4119,10 @@ class TestClass:
             timeout=ClientTimeout(),
         )
 
-        # Python 3.9 fixes [a bug](https://github.com/python/cpython/issues/90645) for correctly accessing buffer limits
-        # from SSL transport
-        ssl_transport = (
-            conn.transport
-            if sys.version_info[0:2] >= (3, 9)
-            else conn.transport._ssl_protocol._transport
-        )
-        assert ssl_transport.get_write_buffer_limits() == (4 * 1024, 16 * 1024)
+        # Using conn.transport.get_write_buffer_limits() directly raises
+        # "AttributeError: _low_water", but the set... method works?
+        ssl_transport = conn.transport._ssl_protocol._transport
+        assert ssl_transport.get_write_buffer_limits()[1] == 16 * 1024
 
     async def test_upload_filter(self, async_client, aioresponse):
         await async_client.receive_response(
